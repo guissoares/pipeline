@@ -1,7 +1,7 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import pipeline
-import pdb
 
 @pipeline.stage
 def a():
