@@ -1,35 +1,41 @@
 # -*- coding: utf-8 -*-
 
-import queue
 import multiprocessing
+from queue import Empty
 from collections import deque
 from collections.abc import Sequence, Mapping
 import time
 
-def stage(func, queue_size=10):
-    return Stage(func, queue_size)
+def stage(loop_func, queue_size=10, **kwargs):
+    """ Decorator que transforma a função em um objeto da classe Stage. """
+    return Stage(loop_func=loop_func, queue_size=queue_size, kwargs=kwargs)
 
 class Stage(object):
     """ Classe que define um estágio do pipeline. """
 
-    def __init__(self, func, queue_size=10):
+    def __init__(self, loop_func=None, init_func=None, queue_size=10, args=(), kwargs={}):
         """ Construtor.
             Parâmetros:
             - func: Função a ser executada para cada novo dado de entrada do estágio.
             - queue_size: Tamanho da fila de saída.
+            - args e kwargs: Parâmetros a serem passados para a função init_func.
         """
         self._queue_size = queue_size
-        self._func = func
-        self._loop_func = None
+        if init_func is not None:
+            self.init = init_func
+        if loop_func is not None:
+            self.loop = loop_func
         self._input = None
         self._output = None
         self._queue = None
         self._event_stop = None
         self._process = None
         self._pipeline = None
+        self._args = args
+        self._kwargs = kwargs
 
     def __call__(self, stage=None):
-        """ Conecta a entrada do estágio atual à saída do estágio fornecido como argumento, ou
+        """ Conecta a entrada do estágio atual à saída do estágio fornecido como argumento,
             ou define o estágio atual como sendo o primeiro.
         """
         if stage is not None:
@@ -38,18 +44,28 @@ class Stage(object):
         self._event_stop = multiprocessing.Event()
         return self
 
+    def init(self, *args, **kwargs):
+        """ Método de inicialização do estágio, que pode ser redefinido em uma subclasse.
+            Difere do método padrão __init__() por ser executado diretamente no processo filho.
+        """
+        pass
+
+    def loop(self, *args, **kwargs):
+        """ Método de loop do estágio, que pode ser redefinido em uma subclasse. """
+        pass
+
     def _create_queue(self):
         """ Cria a fila de saída do estágio. """
         self._queue = multiprocessing.Queue(maxsize=self._queue_size)
 
     def _start(self):
         """ Inicia a execução do estágio do pipeline. """
-        # Se for o um pipeline com um único estágio
+        # Se for um pipeline com um único estágio
         if self._input is None and self._output is None:
-            def loop_func():
-                # Loop principal do estágio
+            def target():
+                self.init(*self._args, **self._kwargs)
+                gen = self.loop()
                 # Só termina se o sinal de parada for dado ou se o gerador chegar ao fim
-                gen = self._func()
                 while not self._event_stop.is_set():
                     try:
                         next(gen)
@@ -58,10 +74,10 @@ class Stage(object):
         # Se for o primeiro estágio do pipeline
         elif self._input is None:
             self._create_queue()
-            def loop_func():
-                # Loop principal do estágio
+            def target():
+                self.init(*self._args, **self._kwargs)
                 # Só termina se o sinal de parada for dado ou se o gerador chegar ao fim
-                gen = self._func()
+                gen = self.loop()
                 while not self._event_stop.is_set():
                     try:
                         output_data = next(gen)
@@ -71,44 +87,43 @@ class Stage(object):
                 self._output._event_stop.set()
         # Se for o último estágio do pipeline
         elif self._output is None:
-            def loop_func():
-                # Loop principal do estágio
+            def target():
+                self.init(*self._args, **self._kwargs)
                 # Só termina se o sinal de parada for dado e se a fila de entrada estiver vazia
                 while not self._event_stop.is_set() or not self._input._queue.empty():
                     try:
                         input_data = self._input._queue.get(block=True, timeout=1)
-                        if isinstance(input_data, Sequence):
-                            output_data = self._func(*input_data)
-                        elif isinstance(input_data, Mapping):
-                            output_data = self._func(**input_data)
-                        else:
-                            output_data = self._func(input_data)
+                        self._call_loop_func(input_data)
                     except queue.Empty:
                         pass
         # Demais estágios do pipeline
         else:
             self._create_queue()
-            def loop_func():
-                # Loop principal do estágio
+            def target():
+                self.init(*self._args, **self._kwargs)
                 # Só termina se o sinal de parada for dado e se a fila de entrada estiver vazia
                 while not self._event_stop.is_set() or not self._input._queue.empty():
                     try:
                         input_data = self._input._queue.get(block=True, timeout=1)
-                        if isinstance(input_data, Sequence):
-                            output_data = self._func(*input_data)
-                        elif isinstance(input_data, Mapping):
-                            output_data = self._func(**input_data)
-                        else:
-                            output_data = self._func(input_data)
+                        output_data = self._call_loop_func(input_data)
                         if self._queue is not None:
                             self._queue.put(output_data, block=True, timeout=None)
                     except queue.Empty:
                         pass
                 if self._output is not None:
                     self._output._event_stop.set()
-        self._loop_func = loop_func
-        self._process = multiprocessing.Process(target=self._loop_func, daemon=True)
+        self._process = multiprocessing.Process(target=target, daemon=True)
         self._process.start()
+
+    def _call_loop_func(self, input_data):
+        """ Método auxiliar para chamar a função de loop de acordo com o tipo de entrada. """
+        if isinstance(input_data, Sequence):
+            output_data = self.loop(*input_data)
+        elif isinstance(input_data, Mapping):
+            output_data = self.loop(**input_data)
+        else:
+            output_data = self.loop(input_data)
+        return output_data
 
     def _stop(self, timeout=4):
         """ Para a execução do estágio, esperando a conclusão da iteração atual. """
@@ -128,18 +143,14 @@ class Pipeline(object):
         """ Construtor. """
         self.stages = deque()
         stage = last_stage
-        while True:
+        while stage is not None:
             self.stages.appendleft(stage)
-            if stage._input is None:
-                stage._pipeline = self
-                break
             stage = stage._input
 
     def add(self, stage):
         """ Adiciona um estágio ao pipeline. """
         if len(self.stages) == 0:
             stage()
-            stage._pipeline = self
         else:
             stage(self.stages[-1])
         self.stages.append(stage)
