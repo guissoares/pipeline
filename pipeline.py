@@ -94,7 +94,7 @@ class Stage(object):
                     try:
                         input_data = self._input._queue.get(block=True, timeout=1)
                         self._call_loop_func(input_data)
-                    except queue.Empty:
+                    except Empty:
                         pass
         # Demais estágios do pipeline
         else:
@@ -108,7 +108,7 @@ class Stage(object):
                         output_data = self._call_loop_func(input_data)
                         if self._queue is not None:
                             self._queue.put(output_data, block=True, timeout=None)
-                    except queue.Empty:
+                    except Empty:
                         pass
                 if self._output is not None:
                     self._output._event_stop.set()
